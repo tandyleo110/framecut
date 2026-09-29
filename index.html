@@ -1,412 +1,4 @@
-#!/usr/bin/env node
-'use strict';
-/*
- * 视频切帧工具  ——  单文件版（Node.js + 内置 HTML）
- * 用法: node 视频切帧.js      然后浏览器打开 http://127.0.0.1:8765
- * 依赖: 系统里的 ffmpeg (同目录放 ffmpeg.exe 也可以)
- * 产物: <脚本所在目录>/cut-data/<视频名>/00001.png ...
- */
-
-const http = require('http');
-const fs = require('fs');
-const fsp = fs.promises;
-const path = require('path');
-const os = require('os');
-const { spawn, spawnSync } = require('child_process');
-
-const PORT = 8765;
-const ROOT = __dirname;
-const OUT_ROOT = path.join(ROOT, 'cut-data');
-const TMP_ROOT = path.join(os.tmpdir(), 'vcut-tmp');
-
-/* ---------------- 工具 ---------------- */
-
-function findFF() {
-  const local = path.join(ROOT, 'ffmpeg.exe');
-  if (fs.existsSync(local)) return { ffmpeg: local, ffprobe: path.join(ROOT, 'ffprobe.exe') };
-  const probe = spawnSync('ffprobe', ['-version'], { stdio: 'ignore' });
-  const hasProbe = !probe.error;
-  const ff = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' });
-  if (!ff.error) return { ffmpeg: 'ffmpeg', ffprobe: hasProbe ? 'ffprobe' : null };
-  return null;
-}
-
-const FFMPEG_BIN = findFF();
-
-/* ffmpeg 版本号, 启动时探测一次 */
-const FFMPEG_VER = (() => {
-  if (!FFMPEG_BIN) return null;
-  try {
-    const r = spawnSync(FFMPEG_BIN.ffmpeg, ['-version'], { encoding: 'utf8', windowsHide: true });
-    const m = (r.stdout || '').match(/ffmpeg version (\S+)/);
-    return m ? m[1] : 'unknown';
-  } catch (_) { return 'unknown'; }
-})();
-
-/** 把用户给的名字变成一个安全的单层文件夹名 */
-function safeName(raw) {
-  let n = String(raw || '').trim();
-  n = n.replace(/[\\/:*?"<>|]/g, '_');   // 非法字符
-  n = n.replace(/\.+$/, '');             // 去掉结尾的点
-  n = n.replace(/^\.+/, '');
-  n = n.replace(/[\x00-\x1f]/g, '');
-  if (!n) return null;
-  if (n.length > 120) n = n.slice(0, 120);
-  return n;
-}
-
-function getExt(name) {
-  const e = path.extname(name).toLowerCase();
-  return /^\.(mp4|mov|mkv|avi|webm|flv|wmv|m4v|mpg|mpeg|ts|3gp)$/.test(e) ? e : '.mp4';
-}
-
-/* ---------------- ffprobe 读视频信息 ---------------- */
-
-function parseRate(s) {
-  if (!s) return 0;
-  const m = String(s).match(/^(\d+)\s*\/\s*(\d+)$/);
-  if (m) { const d = +m[2]; return d ? (+m[1]) / d : 0; }
-  const n = parseFloat(s);
-  return isNaN(n) ? 0 : n;
-}
-
-function probeMedia(file) {
-  if (!FFMPEG_BIN || !FFMPEG_BIN.ffprobe) return null;
-  try {
-    const r = spawnSync(FFMPEG_BIN.ffprobe,
-      ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file],
-      { encoding: 'utf8', windowsHide: true, maxBuffer: 32 * 1024 * 1024 });
-    if (r.status !== 0 || !r.stdout) return null;
-    const j = JSON.parse(r.stdout);
-    const v = (j.streams || []).find(s => s.codec_type === 'video');
-    if (!v) return null;
-    const dur = parseFloat(j.format?.duration ?? v.duration ?? 0) || 0;
-    const fps = parseRate(v.avg_frame_rate) || parseRate(v.r_frame_rate);
-    let total = parseInt(v.nb_frames, 10);
-    if (!isFinite(total) || total <= 0) total = fps > 0 ? Math.round(fps * dur) : 0;
-    return {
-      codec: v.codec_name || '?',
-      width: v.width || 0,
-      height: v.height || 0,
-      duration: dur,
-      fps: Math.round(fps * 1000) / 1000,
-      frames: total,
-      size: Number(j.format?.size) || 0,
-      bitrate: j.format?.bit_rate ? Math.round(+j.format.bit_rate / 1000) + ' kbps' : '',
-    };
-  } catch (_) { return null; }
-}
-
-function dropUpload(token) {
-  const u = token && uploads.get(token);
-  if (u) { uploads.delete(token); fsp.unlink(u.path).catch(() => {}); }
-}
-
-/* ---------------- 任务状态 ---------------- */
-
-const jobs = new Map();   // id -> {name, total, done, status, error, proc, sse:Set}
-const uploads = new Map(); // token -> {path, name, meta}  已上传待切的文件
-
-let jobSeq = 0, upSeq = 0;
-
-function broadcast(job) {
-  const payload = `data: ${JSON.stringify({
-    name: job.name, total: job.total, done: job.done, status: job.status, error: job.error
-  })}\n\n`;
-  for (const res of job.sse) { try { res.write(payload); } catch (_) {} }
-}
-
-function finish(job, status, error) {
-  job.status = status;
-  job.error = error || null;
-  broadcast(job);
-  if (status !== 'running') {
-    for (const res of job.sse) { try { res.end(); } catch (_) {} }
-    job.sse.clear();
-  }
-}
-
-/* ---------------- ffmpeg 抽帧 ---------------- */
-
-async function cut(job, videoPath, outDir, fps, ext) {
-  const args = ['-hide_banner', '-y', '-i', videoPath, '-pix_fmt', 'rgb24'];
-  if (Number(fps) > 0) args.push('-r', String(Math.floor(fps)));
-  if (ext === 'jpg') args.push('-q:v', '2');
-  args.push('-start_number', '1', path.join(outDir, '%5d.' + ext));
-
-  const argsStr = 'ffmpeg ' + args.map(a => (/\s/.test(a) ? '"' + a + '"' : a)).join(' ');
-  job.log = argsStr;
-
-  await fsp.mkdir(outDir, { recursive: true });
-
-  return new Promise((resolve) => {
-    const proc = spawn(FFMPEG_BIN.ffmpeg, args, { windowsHide: true });
-    job.proc = proc;
-    let stderrTail = '';
-
-    proc.stderr.on('data', (buf) => {
-      const s = buf.toString('utf8');
-      stderrTail = (stderrTail + s).slice(-4000);
-      for (const m of s.matchAll(/frame=\s*(\d+)/g)) {
-        const n = parseInt(m[1], 10);
-        if (n > job.done) { job.done = n; broadcast(job); }
-      }
-      if (/Error|Invalid|Unknown|Unable|failed/i.test(s) && job.status === 'running') {
-        // 只记日志，不立刻判死，ffmpeg 退出码才是准的
-      }
-    });
-
-    proc.on('error', (e) => { finish(job, 'error', '无法启动 ffmpeg: ' + e.message); resolve(); });
-
-    proc.on('close', async (code) => {
-      job.proc = null;
-      if (job.status === 'canceled') return resolve();
-      if (code !== 0) {
-        const line = stderrTail.split(/\r?\n/).filter(l => /error|invalid|unable/i.test(l)).pop() || `ffmpeg 退出码 ${code}`;
-        return finish(job, 'error', line.trim()), resolve();
-      }
-      let n = 0;
-      try {
-        const files = await fsp.readdir(outDir);
-        n = files.filter(f => f.toLowerCase().endsWith('.' + ext)).length;
-      } catch (_) {}
-      job.total = n; job.done = n;
-      finish(job, 'done');
-      resolve();
-    });
-  });
-}
-
-/* ---------------- HTTP ---------------- */
-
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-  '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.mkv': 'video/x-matroska',
-  '.json': 'application/json; charset=utf-8',
-};
-
-function send(res, code, type, body, extra) {
-  res.writeHead(code, Object.assign({ 'Content-Type': type, 'Cache-Control': 'no-store' }, extra || {}));
-  res.end(body);
-}
-const json = (res, code, obj) => send(res, code, MIME['.json'], JSON.stringify(obj));
-
-function readBody(req, limit) {
-  return new Promise((resolve, reject) => {
-    const chunks = []; let size = 0;
-    req.on('data', (c) => {
-      size += c.length;
-      if (size > limit) { reject(new Error('文件太大')); req.destroy(); return; }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
-/** 只能访问 cut-data 下的直接子项，防目录穿越 */
-function resolveInOut(relName) {
-  const n = safeName(relName);
-  if (!n) return null;
-  const p = path.join(OUT_ROOT, n);
-  if (path.dirname(p) !== path.resolve(OUT_ROOT)) return null;
-  return p;
-}
-
-async function handleApi(req, res, url) {
-  const p = url.pathname;
-
-  if (p === '/api/list') {
-    let dirs = [];
-    try {
-      dirs = (await fsp.readdir(OUT_ROOT, { withFileTypes: true }))
-        .filter(d => d.isDirectory()).map(d => d.name);
-    } catch (_) {}
-    const out = [];
-    for (const d of dirs) {
-      const n = safeName(d);
-      if (n !== d) continue;
-      try {
-        const files = await fsp.readdir(path.join(OUT_ROOT, d));
-        const png = files.filter(f => /\.png$/i.test(f)).length;
-        const jpg = files.filter(f => /\.(jpg|jpeg)$/i.test(f)).length;
-        const ext = png ? 'png' : 'jpg';
-        if (png || jpg) out.push({ name: d, count: png || jpg, ext });
-      } catch (_) {}
-    }
-    return json(res, 200, { dirs: out, hasFfmpeg: !!FFMPEG_BIN, ffmpegVer: FFMPEG_VER, ffmpegPath: FFMPEG_BIN ? FFMPEG_BIN.ffmpeg : null });
-  }
-
-  if (p === '/api/frames') {
-    const dir = resolveInOut(url.searchParams.get('dir') || '');
-    if (!dir) return json(res, 400, { error: '无效的名称' });
-    let entries;
-    try { entries = await fsp.readdir(dir, { withFileTypes: true }); }
-    catch (_) { return json(res, 404, { error: '目录不存在' }); }
-
-    // 一次 readdir 拿全量, 不再对每帧发一次 HEAD
-    const files = [];
-    let bytes = 0;
-    for (const d of entries) {
-      if (!d.isFile()) continue;
-      if (!/^\d{5,}\.(png|jpg|jpeg)$/i.test(d.name)) continue;
-      files.push(d.name);
-      try { bytes += (await fsp.stat(path.join(dir, d.name))).size; } catch (_) {}
-    }
-    files.sort();                       // 已补零, 字典序即帧序
-    return json(res, 200, { dir: path.basename(dir), count: files.length, bytes, files });
-  }
-
-  if (p === '/api/probe' && req.method === 'POST') {
-    if (!FFMPEG_BIN) return json(res, 500, { error: '未找到 ffmpeg' });
-    const origName = url.searchParams.get('name') || '';
-    await fsp.mkdir(TMP_ROOT, { recursive: true });
-    const token = 'u' + (++upSeq) + '_' + Date.now().toString(36);
-    const dest = path.join(TMP_ROOT, token + getExt(origName));
-    let body;
-    try { body = await readBody(req, 8 * 1024 * 1024 * 1024); }
-    catch (e) { return json(res, 400, { error: e.message }); }
-    if (!body.length) return json(res, 400, { error: '没有收到文件内容' });
-    await fsp.writeFile(dest, body);
-
-    const meta = probeMedia(dest);
-    uploads.set(token, { path: dest, name: origName, meta });
-    return json(res, 200, { token, meta });
-  }
-
-  if (p === '/api/cut' && req.method === 'POST') {
-    if (!FFMPEG_BIN) return json(res, 500, { error: '未找到 ffmpeg' });
-    let origName = url.searchParams.get('name') || '';
-    /* 文件夹名 = 视频文件名去掉扩展名, 例如 apple.mp4 -> cut-data/apple */
-    const name = safeName(path.basename(origName, path.extname(origName)));
-    if (!name) return json(res, 400, { error: '无效的文件名' });
-    const fps = Math.max(0, Math.min(240, parseInt(url.searchParams.get('fps') || '0', 10) || 0));
-    const ext = (url.searchParams.get('ext') || 'png').toLowerCase() === 'jpg' ? 'jpg' : 'png';
-
-    const job = { id: ++jobSeq, name, total: 0, done: 0, status: 'running', error: null, sse: new Set(), proc: null, ext };
-    jobs.set(job.id, job);
-
-    // 清理旧产物
-    const outDir = path.join(OUT_ROOT, name);
-    await fsp.mkdir(OUT_ROOT, { recursive: true });
-    try {
-      for (const f of await fsp.readdir(outDir)) {
-        if (/^\d{5,}\.(png|jpg|jpeg)$/i.test(f)) await fsp.unlink(path.join(outDir, f)).catch(() => {});
-      }
-    } catch (_) {}
-
-    /* 优先复用 /api/probe 已上传的临时文件, 省掉二次上传 */
-    const token = url.searchParams.get('token') || '';
-    const up = uploads.get(token);
-    let videoPath;
-
-    if (up && await fsp.stat(up.path).then(() => true).catch(() => false)) {
-      uploads.delete(token);
-      videoPath = up.path;
-      origName = origName || up.name;
-    } else {
-      await fsp.mkdir(TMP_ROOT, { recursive: true });
-      videoPath = path.join(TMP_ROOT, job.id + getExt(origName));
-      let body;
-      try {
-        body = await readBody(req, 8 * 1024 * 1024 * 1024);
-      } catch (e) {
-        finish(job, 'error', e.message);
-        return json(res, 400, { error: e.message, id: job.id });
-      }
-      if (!body.length) { finish(job, 'error', '没有收到文件内容'); return json(res, 400, { error: '没有收到文件内容', id: job.id }); }
-      await fsp.writeFile(videoPath, body);
-    }
-
-    // 已知总帧数时进度条才能显示百分比
-    if (up && up.meta && up.meta.frames) {
-      if (fps > 0) job.total = Math.round(up.meta.frames * fps / (up.meta.fps || 1));
-      else job.total = up.meta.frames;
-    }
-
-    // 不 await，先把 id 返回给前端去订阅进度
-    cut(job, videoPath, outDir, fps, ext)
-      .catch(e => finish(job, 'error', e.message))
-      .finally(() => fsp.unlink(videoPath).catch(() => {}));
-
-    return json(res, 200, { id: job.id, name, outDir, total: job.total });
-  }
-
-  if (p === '/api/events') {
-    const id = parseInt(url.searchParams.get('id') || '0', 10);
-    const job = jobs.get(id);
-    if (!job) return json(res, 404, { error: 'no job' });
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    });
-    res.write(': ok\n\n');
-    job.sse.add(res);
-    if (job.status !== 'running') { broadcast(job); res.end(); }
-    const ka = setInterval(() => { try { res.write(': ka\n\n'); } catch (_) {} }, 20000);
-    req.on('close', () => { clearInterval(ka); job.sse.delete(res); });
-    return;
-  }
-
-  if (p === '/api/cancel' && req.method === 'POST') {
-    const id = parseInt(url.searchParams.get('id') || '0', 10);
-    const job = jobs.get(id);
-    if (job && job.proc) { job.status = 'canceled'; try { job.proc.kill(); } catch (_) {} finish(job, 'canceled'); return json(res, 200, { ok: true }); }
-    return json(res, 200, { ok: false });
-  }
-
-  /* 放弃已上传但还没切的临时文件 */
-  if (p === '/api/release' && req.method === 'POST') {
-    dropUpload(url.searchParams.get('token') || '');
-    return json(res, 200, { ok: true });
-  }
-
-  if (p === '/api/delete' && req.method === 'POST') {
-    const dir = resolveInOut(url.searchParams.get('name') || '');
-    if (!dir) return json(res, 400, { error: '无效的名称' });
-    await fsp.rm(dir, { recursive: true, force: true });
-    return json(res, 200, { ok: true });
-  }
-
-  if (p === '/api/open' && req.method === 'POST') {
-    const dir = resolveInOut(url.searchParams.get('name') || '');
-    if (!dir) return json(res, 400, { error: '无效的名称' });
-    spawn('cmd', ['/c', 'explorer', dir], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-    return json(res, 200, { ok: true });
-  }
-
-  return json(res, 404, { error: 'not found' });
-}
-
-async function handleAsset(res, url) {
-  const name = safeName(url.searchParams.get('dir') || '');
-  const file = path.basename(url.searchParams.get('f') || '');
-  if (!name || !/^\d{5,}\.(png|jpg|jpeg)$/i.test(file)) return send(res, 400, 'text/plain', 'bad');
-  const dir = path.join(OUT_ROOT, name);
-  if (path.dirname(path.join(dir, file)) !== path.resolve(dir)) return send(res, 400, 'text/plain', 'bad');
-  let st;
-  try { st = await fsp.stat(path.join(dir, file)); } catch (_) { return send(res, 404, 'text/plain', 'not found'); }
-  res.writeHead(200, { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Content-Length': st.size, 'Cache-Control': 'public, max-age=31536000' });
-  fs.createReadStream(path.join(dir, file)).pipe(res);
-}
-
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://x');
-  try {
-    if (url.pathname === '/' ) return send(res, 200, MIME['.html'], PAGE);
-    if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
-    if (url.pathname === '/f') return await handleAsset(res, url);
-    return send(res, 404, 'text/plain', 'not found');
-  } catch (e) {
-    try { json(res, 500, { error: e.message }); } catch (_) {}
-  }
-});
-
-/* ---------------- 内置页面 ---------------- */
-
-const PAGE = `<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -518,7 +110,7 @@ const PAGE = `<!DOCTYPE html>
         </div>
         <div class="opt">
           <label><b>问题 2</b> &nbsp;输出图片格式</label>
-          <div class="segs">
+          <div class="segs" id="qfmt">
             <button class="on" data-ext="png">png</button>
             <button data-ext="jpg">jpg</button>
           </div>
@@ -532,6 +124,36 @@ const PAGE = `<!DOCTYPE html>
 
       <div class="bar" id="bar" style="display:none"><i id="fill"></i></div>
       <div class="status" id="status"></div>
+    </div>
+  </div>
+
+  <!-- 切片段紧跟在切帧卡片下面：看到帧号就顺手能切，不用滚到页面最底 -->
+  <div id="clipbox" style="display:none">
+    <div class="card">
+      <h2 style="margin:0 0 4px">切片段 <span class="n" id="clipdir"></span></h2>
+      <div class="sm2" style="color:var(--dim);font-size:12px;margin-bottom:14px">
+        填缩略图上的帧号（每张图下面那个数字），起止都含。文件落在<b>脚本所在目录</b>，名字形如
+        <code id="clipname">视频名_97-263.mp4</code>。
+      </div>
+      <div class="row" style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
+        <div class="opt">
+          <label><b>起始帧</b></label>
+          <input type="number" id="cfrom" min="1" step="1" value="97">
+        </div>
+        <div class="opt">
+          <label><b>结束帧</b></label>
+          <input type="number" id="cto" min="1" step="1" value="263">
+        </div>
+        <div class="opt">
+          <div class="mrow" id="clipmode" style="margin-top:2px"></div>
+        </div>
+        <div class="opt">
+          <button class="act" id="clipgo">开始切片段</button>
+        </div>
+      </div>
+      <div class="bar" id="clipbar" style="display:none"><i id="clipfill"></i></div>
+      <div class="status" id="clipstatus"></div>
+      <div id="clipdone" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:13px"></div>
     </div>
   </div>
 
@@ -565,6 +187,7 @@ const NL = String.fromCharCode(10);
 window.onerror = (m,s,l) => { st('页面脚本出错: ' + m + ' (行' + l + ')', 'err'); };
 
 let picked = null, ext = 'png', jobId = 0, es = null, curDir = '', meta = null, token = null, objUrl = null;
+let clipES = null;
 
 /* ffmpeg 检测 */
 fetch('/api/list').then(r=>r.json()).then(d=>{
@@ -580,8 +203,8 @@ fetch('/api/list').then(r=>r.json()).then(d=>{
 });
 
 /* 格式切换 */
-document.querySelectorAll('.segs button').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('.segs button').forEach(x=>x.classList.remove('on'));
+document.querySelectorAll('#qfmt button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#qfmt button').forEach(x=>x.classList.remove('on'));
   b.classList.add('on'); ext=b.dataset.ext;
 });
 
@@ -657,6 +280,7 @@ function upload(f){
     }
     $('#ph').style.display='none';
     $('#go').disabled=false;
+    syncClipbox();     // 信息一读出来就把「切片段」摆出来
   };
   x.onerror=()=>st('上传失败，请重试','err');
   x.send(f);
@@ -687,6 +311,26 @@ function presets(){
     calc();
   });
 }
+/* 切片段面板：一旦视频读出信息就该出现，不用等切完帧 */
+function syncClipbox(){
+  const box=$('#clipbox');
+  if(!box) return;
+  const ready = !!(picked && meta && token);
+  box.style.display=ready?'':'none';
+  if(!ready) return;
+  $('#clipdir').textContent='当前视频：'+picked.name+'　共 '+meta.frames+' 帧';
+  /* 只陈述实际会发生什么, 不给选择 */
+  const ENC={hevc:'HEVC',h264:'H.264',av1:'AV1',vp9:'VP9'};
+  $('#clipmode').innerHTML =
+    '<i>编码 <b>'+(ENC[meta.codec]||meta.codec||'?')+'</b>（与源一致）</i>'+
+    '<i>画质 <b>无损</b></i>'+
+    '<i>像素 <b>'+esc(meta.pixFmt||'-')+'</b></i>';
+  const b=fnameOf(picked.name);
+  const upd=()=>{ const f=$('#cfrom').value,c=$('#cto').value;
+    $('#clipname').textContent=b+'_'+(f||'起')+'-'+(c||'止')+'.mp4'; };
+  $('#cfrom').oninput=upd; $('#cto').oninput=upd;
+  upd();
+}
 const fnameOf=n=>String(n).replace(/[.][^.]+$/,'');
 const dur=s=>{ s=+s||0; const m=Math.floor(s/60), x=(s%60).toFixed(1);
   return (m?m+':':'')+x; };
@@ -705,7 +349,8 @@ bind('#go', el => el.onclick = async () => {
   try{ d = await (await fetch('/api/cut?'+q,{method:'POST'})).json(); }
   catch(err){ st('切帧请求失败：'+err.message,'err'); $('#go').disabled=false; return; }
   if(d.error){ st(d.error,'err'); $('#go').disabled=false; return; }
-  token=null; jobId=d.id; curDir=d.name;
+  /* token 不能清 —— 切完帧还要用它切片段, 后端也还留着这个上传 */
+  jobId=d.id; curDir=d.name;
   listen(jobId);
 });
 
@@ -761,6 +406,7 @@ async function load(name){
   const grid=$('#grid'); grid.innerHTML='<div class="empty">读取中…</div>';
   $('#out').style.display='';
   $('#tname').textContent=name;
+  syncClipbox();
 
   let d;
   try{ d = await (await fetch('/api/frames?dir='+encodeURIComponent(name))).json(); }
@@ -827,6 +473,66 @@ function show(f){ $('#lbimg').src='/f?dir='+encodeURIComponent(curDir)+'&f='+enc
 if(lb) lb.onclick=()=>lb.style.display='none';
 document.addEventListener('keydown',e=>{if(e.key==='Escape')lb.style.display='none';});
 
+/* ---------- 切片段 ---------- */
+bind('#clipgo', el => el.onclick = async () => {
+  const from = parseInt($('#cfrom').value||'', 10);
+  const to   = parseInt($('#cto').value||'', 10);
+  if(!isFinite(from)||!isFinite(to)||from<1||to<from){
+    cst('帧号不对：需要「起始 - 结束」，且 结束 ≥ 起始 ≥ 1','err'); return;
+  }
+  if(meta && to > meta.frames){
+    cst('结束帧 '+to+' 超出总帧数 '+meta.frames,'err'); return;
+  }
+  if(!picked||!token){ cst('视频已失效，请重新选一次','err'); return; }
+
+  if(clipES){clipES.close();clipES=null;}
+  $('#clipgo').disabled=true;
+  $('#clipbar').style.display=''; $('#clipfill').style.width='0%';
+  $('#clipdone').style.display='none';
+  cst('准备剪辑…');
+
+  const q=new URLSearchParams({name:picked.name, from:String(from), to:String(to), token});
+  let d;
+  try{ d = await (await fetch('/api/clip?'+q,{method:'POST'})).json(); }
+  catch(err){ cst('请求失败：'+err.message,'err'); $('#clipgo').disabled=false; return; }
+  if(d.error){ cst(d.error,'err'); $('#clipgo').disabled=false; return; }
+  /* token 保留, 切完还能接着切下一段 */
+  listenClip(d.id);
+});
+
+function listenClip(id){
+  clipES=new EventSource('/api/events?id='+id);
+  clipES.onmessage=e=>{
+    const s=JSON.parse(e.data);
+    if(s.status==='running'){
+      const pct=s.total?Math.min(100,Math.round(s.done/s.total*100)):0;
+      $('#clipfill').style.width=pct+'%';
+      cst('剪辑中 '+pct+'%　已输出 <b>'+s.done+'</b> / '+(s.total||'?')+' 帧');
+    }else if(s.status==='done'){
+      $('#clipfill').style.width='100%';
+      const want=Number(s.total), got=Number(s.realFrames)||0;
+      cst('完成：<b>'+esc(s.file||'')+'</b>　'+got+' 帧　'+mb(s.size));
+      /* 帧数对不上就明说, 别假装成功 */
+      if(got && want && got!==want){
+        cst('⚠ 实际 '+got+' 帧，与要的 '+want+' 帧不符，建议检查','err');
+      }
+      const box=$('#clipdone');
+      box.style.display='';
+      box.innerHTML='已生成 <b>'+esc(s.file||'')+'</b>　('+got+' 帧 / '+mb(s.size)+')'+
+        '<button class="ghost" id="clipOpen" style="margin-left:10px">打开文件夹</button>';
+      const ob=$('#clipOpen');
+      if(ob) ob.onclick=()=>fetch('/api/clip/open',{method:'POST'});
+      $('#clipgo').disabled=false;
+    }else if(s.status==='error'){
+      cst(s.error||'出错了','err'); $('#clipgo').disabled=false;
+    }else if(s.status==='canceled'){
+      cst('已取消'); $('#clipgo').disabled=false;
+    }
+  };
+  clipES.onerror=()=>{clipES.close();clipES=null;};
+}
+function cst(html,cls){ const e=$('#clipstatus'); if(e) e.innerHTML='<span class="'+(cls||'')+'">'+html+'</span>'; }
+
 /* 历史目录 */
 async function refreshList(){
   const d=await (await fetch('/api/list')).json();
@@ -875,34 +581,4 @@ bind('#delDir', el => el.onclick = async () => {
 });
 </script>
 </body>
-</html>`;
-
-/* ---------------- 启动 ---------------- */
-
-(async () => {
-  await fsp.mkdir(OUT_ROOT, { recursive: true });
-  await fsp.mkdir(TMP_ROOT, { recursive: true });
-  /* 清掉上次异常退出残留的临时文件 */
-  try { for (const f of await fsp.readdir(TMP_ROOT)) await fsp.unlink(path.join(TMP_ROOT, f)).catch(() => {}); } catch (_) {}
-
-  if (!FFMPEG_BIN) {
-    console.log('  [警告] 没找到 ffmpeg。请把 ffmpeg.exe 放到本脚本同目录，或加入系统 PATH。\n');
-  }
-
-  server.listen(PORT, '127.0.0.1', () => {
-    const url = 'http://127.0.0.1:' + PORT;
-    console.log('');
-    console.log('  视频切帧工具已启动');
-    console.log('  请在浏览器打开：  ' + url);
-    console.log('  产物目录：       ' + OUT_ROOT);
-    console.log('');
-    try { spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsHide: true }).unref(); } catch (_) {}
-  });
-
-  server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') { console.error('  端口 ' + PORT + ' 被占用，关掉占用它的程序再试。'); process.exit(1); }
-    throw e;
-  });
-})();
-
-process.on('SIGINT', () => { for (const j of jobs.values()) { try { j.proc && j.proc.kill(); } catch (_) {} } process.exit(0); });
+</html>
