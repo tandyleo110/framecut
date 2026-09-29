@@ -242,18 +242,39 @@ function hasAudioStream(file) {
   } catch (_) { return false; }
 }
 
-/* 源编码 -> 本机编码器。全部走真无损, 所以不涉及画质取舍。
-   preset 只影响速度和体积, 不影响画质(lossless 下像素逐位相同),
-   用 medium 平衡: 更慢的 preset 换不来任何画质, 只是把 4K 拖成几小时。
+/* 源编码 -> 本机编码器。编码器永远跟随源视频, 不给切换。
+
+   两档画质, 默认 lossless:
+   - lossless: 解码像素与源逐位相同, 体积必然是源片段的数倍
+   - crf12   : 视觉无损(专业后期通用档), 体积约为 lossless 的 1/8
+
+   preset 用 slow: CRF 是画质门槛而非固定码率, preset 越慢搜索空间越大、
+   同样画质下压得更小。实测同参数 slow 19.7 MiB vs medium 18.0 MiB,
+   小约 9%。慢的那点时间换体积划算。
 
    注意: x265 的 `-qp 0` 并不是无损 —— 量化器归零, 但内部色彩转换仍有
    舍入误差, 实测像素 md5 对不上。必须用 -x265-params lossless=1。
    x264 / libvpx-vp9 的 -qp 0 本身就是真无损。 */
 const ENCODERS = {
-  hevc: { lib: 'libx265', preset: 'medium', lossless: ['-x265-params', 'lossless=1'] },
-  h264: { lib: 'libx264', preset: 'medium', lossless: ['-qp', '0'] },
-  vp9: { lib: 'libvpx-vp9', preset: 'medium', lossless: ['-lossless', '1'] },
+  hevc: {
+    lib: 'libx265', preset: 'slow',
+    lossless: ['-x265-params', 'lossless=1'],
+    crf: ['-crf', '12', '-x265-params', 'aq-mode=3'],
+  },
+  h264: {
+    lib: 'libx264', preset: 'slow',
+    lossless: ['-qp', '0'],
+    crf: ['-crf', '12'],
+  },
+  vp9: {
+    lib: 'libvpx-vp9', preset: 'slow',
+    lossless: ['-lossless', '1'],
+    crf: ['-crf', '12', '-b:v', '0'],
+  },
 };
+
+/** 两档画质, 值域和前端按钮的 data-q 对应 */
+const QUALITIES = { lossless: '逐位无损', crf12: '视觉无损 CRF 12' };
 
 /**
  * 精确切片段。
@@ -282,29 +303,33 @@ async function clipSegment(job, videoPath, from, to, outFile, opts) {
   const startT = pts[a];
   const endT = b + 1 < pts.length ? pts[b + 1] : pts[b] + (opts.fps > 0 ? 1 / opts.fps : 0.04);
 
-  /* -ss 用 pts[a] 的精确值做输入定位：ffmpeg 会解码到该时间点丢弃之前帧,
-     落点就是第 a 帧本身（已用 showinfo checksum 逐帧核对过）。
-     -frames:v 再卡死帧数，防止多吐。 */
+  /* 按帧号 select, 不用 -ss。
+     原因: 源是 VFR, 相邻帧间隔不均匀(实测帧95与帧96只差 2.984ms,
+     而正常间隔 16.7ms)。-ss 是按时间定位, 落点会偏到前一帧, 整段错一帧。
+     select 走的是帧计数, 与时间戳无关, 对 VFR 天然免疫。
+     从头解码到尾, 慢但唯一可靠 —— 帧精确没有捷径。 */
   const args = [
     '-hide_banner', '-y',
-    '-ss', startT.toFixed(6),
     '-i', videoPath,
+    '-vf', `select='between(n\\,${a}\\,${b})',setpts=PTS-STARTPTS`,
     '-frames:v', String(count),
-    '-vf', 'setpts=N/FRAME_RATE/TB',
   ];
 
-  /* 编码器按源视频自动选, 像素格式照抄源的。
-     一律 lossless(qp=0): 解码出来的像素与源逐位相同, 不做有损重压缩。 */
+  /* 编码器按源视频自动选, 像素格式照抄源的。 */
   const enc = ENCODERS[opts.codec] || ENCODERS.hevc;
   if (!enc) return finish(job, 'error', '这个源视频的编码（' + opts.codec + '）本机没有对应的编码器');
 
+  /* 默认逐位无损; crf 档只影响体积, 不影响帧精确性 —— 帧号由 -ss + -frames:v 保证 */
+  const q = QUALITIES[opts.quality] ? opts.quality : 'lossless';
+
   args.push(
     '-c:v', enc.lib,
-    ...enc.lossless,
+    ...(q === 'lossless' ? enc.lossless : enc.crf),
     '-preset', enc.preset,
     '-pix_fmt', opts.pixFmt || 'yuv420p',
-    '-r', opts.fpsStr || '60000/1001',
-    '-fps_mode', 'cfr'
+    /* 不加 -r / -fps_mode: 强制定帧率会让 VFR 源丢帧或补帧。
+       setpts=PTS-STARTPTS 已把时间轴归零, 保留原始帧间隔。 */
+    '-fps_mode', 'passthrough'
   );
 
   /* 色彩元数据照抄源, 否则播放器可能整体偏色 */
@@ -317,10 +342,11 @@ async function clipSegment(job, videoPath, from, to, outFile, opts) {
   }
   if (opts.colorRange === 'pc') args.push('-color_range', 'pc');
 
-  /* 音频: 有轨就带, 且保持源采样率/声道数, 不做降级 */
+  /* 音频: 有轨就带, 保持源采样率/声道数。
+     注意这里用绝对时间 trim —— 已经不用 -ss 了, 音频没有前移过。 */
   const aud = hasAudioStream(videoPath);
   if (aud) {
-    args.push('-af', `atrim=start=0:end=${(endT - startT).toFixed(6)},asetpts=N/SR/TB`,
+    args.push('-af', `atrim=start=${startT.toFixed(6)}:end=${endT.toFixed(6)},asetpts=N/SR/TB`,
       '-c:a', 'aac', '-b:a', '320k');
     if (opts.sampleRate) args.push('-ar', String(opts.sampleRate));
     if (opts.channels) args.push('-ac', String(opts.channels));
@@ -588,11 +614,14 @@ async function handleApi(req, res, url) {
     if (!isFinite(from) || !isFinite(to) || from < 1 || to < from) {
       return json(res, 400, { error: '帧号不对：需要「起始 - 结束」，且结束 ≥ 起始 ≥ 1' });
     }
-    /* 不接受画质/编码参数 —— 一律按源编码做无损, 没有选择 */
+    /* 只接受画质档位, 默认逐位无损。编码不接受 —— 一律跟随源视频。 */
+    const quality = QUALITIES[url.searchParams.get('quality')] ? url.searchParams.get('quality') : 'lossless';
 
-    /* 文件名: 原名_起-止.mp4, 落在脚本同目录 */
+    /* 文件名: 原名_起-止.mp4, 落在脚本同目录。
+       两档画质同名会互相覆盖, 所以 crf 档加 _crf 后缀。 */
     const base = safeName(path.basename(origName, path.extname(origName))) || 'video';
-    const outName = `${base}_${from}-${to}.mp4`;
+    const suffix = quality === 'lossless' ? '' : '_crf';
+    const outName = `${base}_${from}-${to}${suffix}.mp4`;
     const outFile = path.join(CLIP_ROOT, outName);
 
     /* 复用 /api/probe 已上传的临时文件 */
@@ -606,11 +635,11 @@ async function handleApi(req, res, url) {
     /* 用原始分子/分母, 别用四舍五入的小数 */
     const fpsStr = (meta.rateStr && /^[\d\/]+$/.test(meta.rateStr)) ? meta.rateStr : '60000/1001';
 
-    /* 编码/色彩/音频全部照抄源, 不给用户选择 */
+    /* 编码/色彩/音频全部照抄源, 编码不给用户选 */
     const codec = meta.codec || 'hevc';
     if (!ENCODERS[codec]) {
       return json(res, 400, {
-        error: `源视频是 ${codec} 编码，本机没有对应的无损编码器。` +
+        error: `源视频是 ${codec} 编码，本机没有对应的编码器。` +
                `关键帧稀疏的视频无法用流拷贝做帧精确剪辑，必须重编码，` +
                `所以只能先转成 HEVC 或 H.264 再切。`,
       });
@@ -623,7 +652,7 @@ async function handleApi(req, res, url) {
     jobs.set(job.id, job);
 
     clipSegment(job, up.path, from, to, outFile, {
-      codec, fps: meta.fps || 0, fpsStr,
+      codec, quality, fps: meta.fps || 0, fpsStr,
       pixFmt: meta.pixFmt,
       colorPrimaries: meta.colorPrimaries,
       colorTrc: meta.colorTrc,

@@ -145,11 +145,17 @@
           <input type="number" id="cto" min="1" step="1" value="263">
         </div>
         <div class="opt">
-          <div class="mrow" id="clipmode" style="margin-top:2px"></div>
+          <label><b>画质</b></label>
+          <div class="segs" id="cq">
+            <button data-q="lossless" class="on">逐位无损</button>
+            <button data-q="crf12">视觉无损 CRF 12</button>
+          </div>
         </div>
         <div class="opt">
           <button class="act" id="clipgo">开始切片段</button>
         </div>
+      </div>
+      <div class="mrow" id="clipmode" style="margin-top:12px"></div>
       </div>
       <div class="bar" id="clipbar" style="display:none"><i id="clipfill"></i></div>
       <div class="status" id="clipstatus"></div>
@@ -207,6 +213,9 @@ document.querySelectorAll('#qfmt button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('#qfmt button').forEach(x=>x.classList.remove('on'));
   b.classList.add('on'); ext=b.dataset.ext;
 });
+
+/* 片段画质档位, 默认逐位无损 */
+let clipQ = 'lossless';
 
 /* 选择文件 */
 const drop=$('#drop'), inp=$('#file');
@@ -319,15 +328,26 @@ function syncClipbox(){
   box.style.display=ready?'':'none';
   if(!ready) return;
   $('#clipdir').textContent='当前视频：'+picked.name+'　共 '+meta.frames+' 帧';
-  /* 只陈述实际会发生什么, 不给选择 */
-  const ENC={hevc:'HEVC',h264:'H.264',av1:'AV1',vp9:'VP9'};
-  $('#clipmode').innerHTML =
-    '<i>编码 <b>'+(ENC[meta.codec]||meta.codec||'?')+'</b>（与源一致）</i>'+
-    '<i>画质 <b>无损</b></i>'+
-    '<i>像素 <b>'+esc(meta.pixFmt||'-')+'</b></i>';
+  /* 只陈述实际会发生什么。编码跟随源, 不能改。 */
+  const ENC={hevc:'HEVC',h264:'H.264',vp9:'VP9'};
+  /* 注意 isLL 要在函数里读, 不能在外面算好 —— 否则切档位时不更新 */
+  const upd2=()=>{
+    const isLL = clipQ === 'lossless';
+    $('#clipmode').innerHTML =
+      '<i>编码 <b>'+(ENC[meta.codec]||meta.codec||'?')+'</b>（跟随源，不可改）</i>'+
+      '<i>像素 <b>'+esc(meta.pixFmt||'-')+'</b></i>'+
+      '<i>画质 <b>'+(isLL?'逐位无损':'视觉无损 CRF 12')+'</b></i>'+
+      '<i>体积 <b>'+(isLL?'源片段的数倍':'约为无损的 1/8')+'</b></i>';
+  };
+  upd2();
+  $('#cq').querySelectorAll('button').forEach(b=>b.onclick=()=>{
+    $('#cq').querySelectorAll('button').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); clipQ=b.dataset.q; upd2(); upd();
+  });
   const b=fnameOf(picked.name);
   const upd=()=>{ const f=$('#cfrom').value,c=$('#cto').value;
-    $('#clipname').textContent=b+'_'+(f||'起')+'-'+(c||'止')+'.mp4'; };
+    const sf = clipQ==='lossless' ? '' : '_crf';
+    $('#clipname').textContent=b+'_'+(f||'起')+'-'+(c||'止')+sf+'.mp4'; };
   $('#cfrom').oninput=upd; $('#cto').oninput=upd;
   upd();
 }
@@ -491,7 +511,8 @@ bind('#clipgo', el => el.onclick = async () => {
   $('#clipdone').style.display='none';
   cst('准备剪辑…');
 
-  const q=new URLSearchParams({name:picked.name, from:String(from), to:String(to), token});
+  const q=new URLSearchParams({name:picked.name, from:String(from), to:String(to),
+                              quality:clipQ, token});
   let d;
   try{ d = await (await fetch('/api/clip?'+q,{method:'POST'})).json(); }
   catch(err){ cst('请求失败：'+err.message,'err'); $('#clipgo').disabled=false; return; }
