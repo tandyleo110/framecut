@@ -1,0 +1,14 @@
+# 生成物：切帧产物
+cut-data/
+
+# 临时上传文件（正常切完会自清，这里兜底异常退出）
+*.tmp
+vcut-tmp/
+
+# 本地放 ffmpeg 时
+ffmpeg.exe
+ffprobe.exe
+
+node_modules/
+.DS_Store
+Thumbs.db
